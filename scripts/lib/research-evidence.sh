@@ -573,6 +573,13 @@ research_resolve_local_citation() {
         *) return 1 ;;
     esac
     [[ -f "$physical" && -r "$physical" ]] || return 1
+    # Cap cited files like fetched snapshots before counting lines or normalizing
+    # their contents. BSD wc pads its count, so strip whitespace.
+    local size max_bytes="${OCTOPUS_RESEARCH_MAX_RESPONSE_BYTES:-2097152}"
+    [[ "$max_bytes" =~ ^[0-9]{1,15}$ ]] || max_bytes=2097152
+    max_bytes=$((10#$max_bytes))
+    size=$(wc -c < "$physical" 2>/dev/null | tr -d '[:space:]') || return 1
+    [[ "$size" =~ ^[0-9]+$ ]] && (( 10#$size <= 10#$max_bytes )) || return 1
     line_count=$(awk 'END { print NR }' "$physical" 2>/dev/null) || return 1
     for range in ${spec//,/ }; do
         start=$((10#${range%-*}))
@@ -700,6 +707,11 @@ research_verify_synthesis() {
     local in_fence=false
     local snapshot normalized number quote numbers quotes score source_json groups_json
     local project_root token resolved local_refs local_files local_ref local_json evidence_file
+    local local_index cached_index cache_bytes cached_bytes=0 cache_error=false
+    local max_cache_bytes="${OCTOPUS_RESEARCH_MAX_LOCAL_CACHE_BYTES:-16777216}"
+    [[ "$max_cache_bytes" =~ ^[0-9]{1,15}$ ]] || max_cache_bytes=16777216
+    max_cache_bytes=$((10#$max_cache_bytes))
+    local -a normalized_local_paths=() normalized_local_files=()
     project_root="${RESEARCH_PROJECT_ROOT:-}"
     [[ -n "$project_root" ]] || project_root=$(research_default_project_root)
     if [[ -n "$project_root" ]]; then
@@ -798,10 +810,42 @@ research_verify_synthesis() {
                 while IFS= read -r evidence_file; do
                     [[ -n "$evidence_file" ]] || continue
                     checked=true
-                    normalized="$run_dir/.normalized-local.$$"
-                    research_normalize_local_file "$evidence_file" > "$normalized"
+                    cached_index=-1
+                    for ((local_index=0; local_index<${#normalized_local_paths[@]}; local_index++)); do
+                        if [[ "${normalized_local_paths[$local_index]}" == "$evidence_file" ]]; then
+                            cached_index=$local_index
+                            break
+                        fi
+                    done
+                    if [[ "$cached_index" -lt 0 ]]; then
+                        if ! normalized=$(mktemp "$run_dir/.normalized-local.XXXXXXXX"); then
+                            failures=$((failures + 1))
+                            printf 'local_cache_error|%s|mktemp\n' "$line_no" >> "$findings"
+                            cache_error=true
+                            break 2
+                        fi
+                        if ! research_normalize_local_file "$evidence_file" > "$normalized"; then
+                            rm -f -- "$normalized"
+                            failures=$((failures + 1))
+                            printf 'local_cache_error|%s|normalization\n' "$line_no" >> "$findings"
+                            cache_error=true
+                            break 2
+                        fi
+                        cache_bytes=$(wc -c < "$normalized" 2>/dev/null | tr -d '[:space:]') || cache_bytes=""
+                        if [[ ! "$cache_bytes" =~ ^[0-9]+$ ]] || (( cache_bytes > max_cache_bytes - cached_bytes )); then
+                            rm -f -- "$normalized"
+                            failures=$((failures + 1))
+                            printf 'local_cache_limit|%s|limit=%s\n' "$line_no" "$max_cache_bytes" >> "$findings"
+                            cache_error=true
+                            break 2
+                        fi
+                        cached_bytes=$((cached_bytes + cache_bytes))
+                        normalized_local_paths+=("$evidence_file")
+                        normalized_local_files+=("$normalized")
+                    else
+                        normalized="${normalized_local_files[$cached_index]}"
+                    fi
                     grep -Fic -- "$quote" "$normalized" >/dev/null 2>&1 && matched=true
-                    rm -f "$normalized"
                 done <<< "$local_files"
                 if [[ "$checked" == "true" && "$matched" != "true" ]]; then
                     failures=$((failures + 1)); printf 'quote_mismatch|%s|%s\n' "$line_no" "$quote" >> "$findings"
@@ -813,6 +857,9 @@ research_verify_synthesis() {
         printf '{"claim_id":"C%03d","line":%s,"text":%s,"source_ids":[%s],"local_citations":[%s],"independence_groups":[%s],"independence_score":%s}\n' \
             "$claim_count" "$line_no" "$(research_json_string "$line")" \
             "$source_json" "$local_json" "$groups_json" "$score" >> "$claims"
+        if [[ "$cache_error" == "true" ]]; then
+            break
+        fi
     done < "$draft"
     local verification_status="passed"
     [[ "$failures" -gt 0 ]] && verification_status="failed"
@@ -834,6 +881,9 @@ research_verify_synthesis() {
         printf '  ]\n}\n'
     } > "$report"
     rm -f "$findings"
+    if [[ ${#normalized_local_files[@]} -gt 0 ]]; then
+        rm -f -- "${normalized_local_files[@]}"
+    fi
     research_run_event "$run_dir" "verification.completed" "status=$verification_status failures=$failures warnings=$warnings" || true
     [[ "$failures" -eq 0 ]]
 }

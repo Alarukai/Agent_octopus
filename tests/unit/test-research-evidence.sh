@@ -602,4 +602,109 @@ else
     test_fail "unresolvable workspace citations were accepted: $local_bad_kinds"
 fi
 
+test_case "workspace citations to files over the size cap fail closed"
+big_line='  return { status: 500 };'
+{ printf '%s\n' "$big_line"; head -c 400 /dev/zero | tr '\0' 'x'; printf '\n'; } > "$local_root/src/big.ts"
+printf '%s\n' "$big_line" > "$local_root/src/small.ts"
+cap_draft="$RESEARCH_RUN_DIR/local-cap.md"
+{
+    printf '%s\n' '- The oversized file returns 500 (`src/big.ts:1`).'
+    printf '%s\n' '- The small file returns 500 (`src/small.ts:1`).'
+} > "$cap_draft"
+cap_status=0
+OCTOPUS_RESEARCH_MAX_RESPONSE_BYTES=256 research_verify_synthesis "$cap_draft" || cap_status=$?
+cap_kinds=$(jq -r '.checks[] | "\(.line):\(.kind)"' "$RESEARCH_RUN_DIR/verification.json" | tr '\n' ' ')
+if [[ "$cap_status" -ne 0 ]] && [[ "$cap_kinds" == "1:missing_citation " ]]; then
+    test_pass
+else
+    test_fail "size cap not enforced: status=$cap_status checks=[$cap_kinds]"
+fi
+
+test_case "each cited workspace file is normalized once per verification"
+cache_draft="$RESEARCH_RUN_DIR/local-cache.md"
+printf '%s\n' \
+    '- The handler logs "unhandled error" and returns "status: 500" (`src/handler.ts:2-4`).' \
+    '- The handler returns "status: 500" (`src/handler.ts:4`).' > "$cache_draft"
+normalization_calls="$RESEARCH_RUN_DIR/normalization-calls"
+: > "$normalization_calls"
+cache_status=0
+(
+    original_normalizer=$(declare -f research_normalize_local_file)
+    eval "${original_normalizer/research_normalize_local_file/research_normalize_local_file_original}"
+    research_normalize_local_file() {
+        printf 'called\n' >> "$normalization_calls"
+        research_normalize_local_file_original "$1"
+    }
+    research_verify_synthesis "$cache_draft"
+) || cache_status=$?
+call_count=$(wc -l < "$normalization_calls" | tr -d '[:space:]')
+if [[ "$cache_status" -eq 0 && "$call_count" -eq 1 ]]; then
+    test_pass
+else
+    test_fail "workspace file normalized $call_count times; verification status=$cache_status"
+fi
+
+test_case "workspace cache budget fails verification and cleans normalized files"
+printf 'alpha evidence %0170d\n' 0 > "$local_root/src/cache-a.ts"
+printf 'beta evidence %0170d\n' 0 > "$local_root/src/cache-b.ts"
+budget_draft="$RESEARCH_RUN_DIR/local-budget.md"
+printf '%s\n' \
+    '- The first file has "alpha evidence" (`src/cache-a.ts:1`).' \
+    '- The second file has "beta evidence" (`src/cache-b.ts:1`).' > "$budget_draft"
+budget_status=0
+OCTOPUS_RESEARCH_MAX_LOCAL_CACHE_BYTES=256 research_verify_synthesis "$budget_draft" || budget_status=$?
+budget_kind=$(jq -r '.checks[].kind' "$RESEARCH_RUN_DIR/verification.json")
+if [[ "$budget_status" -ne 0 && "$budget_kind" == "local_cache_limit" ]] \
+   && ! ls "$RESEARCH_RUN_DIR"/.normalized-local.* >/dev/null 2>&1; then
+    test_pass
+else
+    test_fail "cache budget did not fail cleanly: status=$budget_status checks=[$budget_kind]"
+fi
+
+test_case "zero-padded cache budget is read as decimal"
+padded_status=0
+OCTOPUS_RESEARCH_MAX_LOCAL_CACHE_BYTES=000512 research_verify_synthesis "$budget_draft" || padded_status=$?
+if [[ "$padded_status" -eq 0 ]] \
+   && jq -e '.status == "passed"' "$RESEARCH_RUN_DIR/verification.json" >/dev/null; then
+    test_pass
+else
+    test_fail "zero-padded 512-byte cache budget rejected two in-budget files"
+fi
+
+test_case "local response cap handles padded and overlong values without arithmetic errors"
+cap_error="$RESEARCH_RUN_DIR/local-cap-error.log"
+physical_local_root=$(cd "$local_root" && pwd -P)
+local_cap_status=0
+OCTOPUS_RESEARCH_MAX_RESPONSE_BYTES=999999999999999999999 \
+    research_resolve_local_citation "$physical_local_root" 'src/small.ts:1' \
+    >/dev/null 2> "$cap_error" || local_cap_status=$?
+padded_local_status=0
+OCTOPUS_RESEARCH_MAX_RESPONSE_BYTES=000256 \
+    research_resolve_local_citation "$physical_local_root" 'src/small.ts:1' \
+    >/dev/null 2>> "$cap_error" || padded_local_status=$?
+if [[ "$local_cap_status" -eq 0 && "$padded_local_status" -eq 0 && ! -s "$cap_error" ]]; then
+    test_pass
+else
+    test_fail "overlong response cap caused a local citation error"
+fi
+
+test_case "normalization failure removes earlier cache files"
+normalization_status=0
+(
+    original_normalizer=$(declare -f research_normalize_local_file)
+    eval "${original_normalizer/research_normalize_local_file/research_normalize_local_file_original}"
+    research_normalize_local_file() {
+        [[ "$1" == */cache-b.ts ]] && return 1
+        research_normalize_local_file_original "$1"
+    }
+    research_verify_synthesis "$budget_draft"
+) || normalization_status=$?
+normalization_kind=$(jq -r '.checks[].kind' "$RESEARCH_RUN_DIR/verification.json")
+if [[ "$normalization_status" -ne 0 && "$normalization_kind" == "local_cache_error" ]] \
+   && ! ls "$RESEARCH_RUN_DIR"/.normalized-local.* >/dev/null 2>&1; then
+    test_pass
+else
+    test_fail "normalization failure left cache files: status=$normalization_status checks=[$normalization_kind]"
+fi
+
 test_summary
